@@ -165,14 +165,19 @@ def probe_resolution(video_path: str, ffprobe_bin: str):
     return int(width), int(height)
 
 
+def escape_filter_path(path: str) -> str:
+    # ffmpeg's filtergraph parser splits filter args on ":" and unescapes "\\"
+    # itself before that split happens, so a Windows drive-letter colon needs
+    # a double backslash (one level to survive the unescape, one to escape
+    # the colon) - a single "\:" is not enough and gets misparsed as a
+    # second positional option (e.g. "original_size").
+    return path.replace("\\", "/").replace(":", "\\\\:")
+
+
 def burn_subtitles(video_path: str, ass_path: str, output_path: str, ffmpeg_bin: str, fontsdir: str | None):
-    # Windows path separators and drive-letter colons both need escaping for the
-    # ffmpeg filtergraph, and the ass= filter argument is itself comma-delimited.
-    escaped_ass = ass_path.replace("\\", "/").replace(":", "\\:")
-    filter_arg = f"ass={escaped_ass}"
+    filter_arg = f"ass={escape_filter_path(ass_path)}"
     if fontsdir:
-        escaped_fontsdir = fontsdir.replace("\\", "/").replace(":", "\\:")
-        filter_arg += f":fontsdir={escaped_fontsdir}"
+        filter_arg += f":fontsdir={escape_filter_path(fontsdir)}"
 
     cmd = [
         ffmpeg_bin,
