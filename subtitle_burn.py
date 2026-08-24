@@ -106,11 +106,34 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: TikTok,{font},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,{outline},0,{alignment},40,40,{margin_v},1
+Style: TikTok,{font},{font_size},{font_color},&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,{outline},0,{alignment},40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
+FONT_COLOR_PRESETS = {
+    "white": "FFFFFF",
+    "yellow": "FFFF00",
+    "red": "FF3B30",
+    "green": "34C759",
+    "cyan": "00FFFF",
+}
+
+
+def resolve_font_color(value: str) -> str:
+    """Accepts a preset name or a #RRGGBB / RRGGBB hex string, returns an
+    ASS PrimaryColour value (format is &HAABBGGRR, i.e. blue/green/red
+    order - the reverse of normal hex - with 00 alpha for fully opaque)."""
+    hex_rgb = FONT_COLOR_PRESETS.get(value.lower(), value.lstrip("#"))
+    if len(hex_rgb) != 6:
+        sys.exit(f"Invalid --font_color: {value!r}. Use a preset ({', '.join(FONT_COLOR_PRESETS)}) or a #RRGGBB hex code.")
+    try:
+        r, g, b = hex_rgb[0:2], hex_rgb[2:4], hex_rgb[4:6]
+        int(hex_rgb, 16)
+    except ValueError:
+        sys.exit(f"Invalid --font_color: {value!r}. Use a preset ({', '.join(FONT_COLOR_PRESETS)}) or a #RRGGBB hex code.")
+    return f"&H00{b}{g}{r}"
 
 
 def build_ass(
@@ -120,6 +143,7 @@ def build_ass(
     res_y: int,
     font: str,
     font_size: int,
+    font_color: str,
     outline: int,
     alignment: int,
     margin_v: int,
@@ -131,6 +155,7 @@ def build_ass(
         res_y=res_y,
         font=font,
         font_size=font_size,
+        font_color=resolve_font_color(font_color),
         outline=outline,
         alignment=alignment,
         margin_v=margin_v,
@@ -211,8 +236,10 @@ def parse_args():
     parser.add_argument("--font_size", type=int, default=18, help="Base font size as a fraction of video height (see --font_size_pct)")
     parser.add_argument("--font_size_pct", type=float, default=0.075,
                          help="Font size as a fraction of video height (default 7.5%%, a typical TikTok caption size)")
+    parser.add_argument("--font_color", default="yellow",
+                         help=f"Caption color: a preset ({', '.join(FONT_COLOR_PRESETS)}) or a #RRGGBB hex code")
     parser.add_argument("--outline", type=int, default=4, help="Outline thickness in pixels-ish (ASS units)")
-    parser.add_argument("--alignment", type=int, default=2,
+    parser.add_argument("--alignment", type=int, default=5,
                          help="ASS alignment (numpad layout): 2=bottom-center, 5=middle-center, 8=top-center")
     parser.add_argument("--margin_v", type=int, default=120, help="Vertical margin from the aligned edge")
     parser.add_argument("--min_word_duration", type=float, default=0.12,
@@ -255,6 +282,7 @@ def main():
             res_y=height,
             font=args.font,
             font_size=font_size,
+            font_color=args.font_color,
             outline=args.outline,
             alignment=args.alignment,
             margin_v=args.margin_v,

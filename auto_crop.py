@@ -232,8 +232,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="Path to the input video file")
     parser.add_argument("output", help="Path to write the cropped 9:16 output video")
-    parser.add_argument("--sample_interval", type=float, default=1.0,
-                         help="Seconds between face-detection samples (default: 1.0)")
+    parser.add_argument("--sample_interval", type=float, default=0.5,
+                         help="Seconds between face-detection samples (default: 0.5 - lower reacts faster to movement "
+                              "but takes longer to process and samples more false positives)")
     parser.add_argument("--out_width", type=int, default=1080, help="Output video width")
     parser.add_argument("--out_height", type=int, default=1920, help="Output video height")
     parser.add_argument("--min_face_size", type=int, default=60,
