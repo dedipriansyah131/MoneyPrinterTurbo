@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Auto-crop to 9:16: sample the video once per second, detect the largest
-face with OpenCV's Haar cascade, then crop the video with ffmpeg so the
-crop window follows the face's position over time.
+face with OpenCV's Haar cascade (frontal + profile), then crop the video
+with ffmpeg so the crop window pans smoothly to follow the face's
+position over time.
 
-This is a lightweight "sample and jump" tracker, not full per-frame face
-tracking - the crop position updates once per --sample_interval seconds.
+This is a lightweight "sample, then interpolate" tracker, not full
+per-frame face tracking - face position is only detected once per
+--sample_interval seconds, but the crop pans continuously between those
+samples instead of jumping.
 
 Usage:
     python auto_crop.py input.mp4 output.mp4
@@ -38,26 +41,43 @@ def check_ffmpeg():
         )
 
 
-def load_face_cascade(cascade_path: str):
+def load_face_cascades(cascade_path: str):
     if cv2 is None:
         sys.exit(
             "opencv-python is not installed. Install it with:\n"
             "    pip install opencv-python-headless==4.10.0.84\n"
             "(pinned: newer 5.x releases have dropped the bundled Haar cascade files)"
         )
-    if not cascade_path:
-        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-    if not os.path.isfile(cascade_path):
+
+    def load(name):
+        cascade = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, name))
+        return cascade if not cascade.empty() else None
+
+    if cascade_path:
+        if not os.path.isfile(cascade_path):
+            sys.exit(f"Face cascade file not found: {cascade_path}")
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            sys.exit(f"Failed to load face cascade from: {cascade_path}")
+        return [cascade]
+
+    # Try frontal faces first (most reliable), then profile faces so a
+    # turned/tilted head is still caught. Newer opencv-python releases have
+    # dropped the bundled cascade files entirely (see the pin above), so
+    # missing files here mean the install needs to be fixed, not a bug.
+    cascades = [
+        load("haarcascade_frontalface_default.xml"),
+        load("haarcascade_frontalface_alt2.xml"),
+        load("haarcascade_profileface.xml"),
+    ]
+    cascades = [c for c in cascades if c is not None]
+    if not cascades:
         sys.exit(
-            f"Face cascade file not found: {cascade_path}\n"
-            "Your opencv-python install may not bundle Haar cascades. Try:\n"
+            "No Haar cascade files found bundled with opencv-python. Try:\n"
             "    pip install opencv-python-headless==4.10.0.84\n"
             "or pass --cascade_path pointing at a haarcascade_frontalface_default.xml file."
         )
-    cascade = cv2.CascadeClassifier(cascade_path)
-    if cascade.empty():
-        sys.exit(f"Failed to load face cascade from: {cascade_path}")
-    return cascade
+    return cascades
 
 
 def probe_video(video_path: str, ffprobe_bin: str):
@@ -82,7 +102,27 @@ def probe_video(video_path: str, ffprobe_bin: str):
     return int(info["width"]), int(info["height"]), float(info["duration"])
 
 
-def detect_face_centers(video_path: str, duration: float, sample_interval: float, axis: str, cascade, min_face_size: int):
+def detect_largest_face(gray, cascades, min_face_size: int):
+    min_size = (min_face_size, min_face_size)
+
+    for cascade in cascades:
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=min_size)
+        if len(faces):
+            return max(faces, key=lambda f: f[2] * f[3])
+
+    # Profile cascades are trained on one facing direction; flip the frame
+    # to also catch faces turned the other way, then mirror the box back.
+    if cascades:
+        flipped = cv2.flip(gray, 1)
+        faces = cascades[-1].detectMultiScale(flipped, scaleFactor=1.1, minNeighbors=5, minSize=min_size)
+        if len(faces):
+            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+            return (gray.shape[1] - x - w, y, w, h)
+
+    return None
+
+
+def detect_face_centers(video_path: str, duration: float, sample_interval: float, axis: str, cascades, min_face_size: int):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         sys.exit(f"OpenCV failed to open video: {video_path}")
@@ -98,13 +138,11 @@ def detect_face_centers(video_path: str, duration: float, sample_interval: float
             continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_face_size, min_face_size)
-        )
-        if len(faces) == 0:
+        face = detect_largest_face(gray, cascades, min_face_size)
+        if face is None:
             samples.append((t, None))
         else:
-            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+            x, y, w, h = face
             center = (x + w / 2) if axis == "x" else (y + h / 2)
             samples.append((t, center))
         t += sample_interval
@@ -143,37 +181,35 @@ def fill_and_smooth(samples, default_center: float, smooth_window: int):
     return smoothed
 
 
-def escape_filter_path(path: str) -> str:
-    # See subtitle_burn.py: ffmpeg's filtergraph parser needs a double
-    # backslash to escape a colon (e.g. a Windows drive letter), a single
-    # backslash is unescaped before the ":" split happens and gets
-    # misparsed as a second positional filter option.
-    return path.replace("\\", "/").replace(":", "\\\\:")
-
-
-def build_sendcmd_file(times, positions, path, axis):
-    lines = []
-    for t, pos in zip(times, positions):
-        lines.append(f"{t:.3f} crop@c {axis} '{round(pos)}';\n")
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+def build_position_expr(times, positions) -> str:
+    """Piecewise-linear interpolation between samples, as an ffmpeg eval
+    expression using the filter's built-in 't' (current timestamp)
+    variable. This makes the crop pan continuously instead of jumping to a
+    new position once per sample."""
+    expr = f"{positions[-1]:.2f}"
+    for i in range(len(positions) - 2, -1, -1):
+        t0, t1 = times[i], times[i + 1]
+        p0, p1 = positions[i], positions[i + 1]
+        if t1 <= t0:
+            continue
+        segment = f"({p0:.2f}+({p1:.2f}-({p0:.2f}))*(t-{t0:.3f})/{(t1 - t0):.3f})"
+        expr = f"if(lt(t,{t1:.3f}),{segment},{expr})"
+    return expr
 
 
 def crop_and_scale(
     video_path: str,
     output_path: str,
-    cmds_path: str,
     crop_w: int,
     crop_h: int,
-    init_x: int,
-    init_y: int,
+    x_expr: str,
+    y_expr: str,
     out_width: int,
     out_height: int,
     ffmpeg_bin: str,
 ):
     filter_arg = (
-        f"sendcmd=f={escape_filter_path(cmds_path)},"
-        f"crop@c=w={crop_w}:h={crop_h}:x={init_x}:y={init_y},"
+        f"crop=w={crop_w}:h={crop_h}:x='{x_expr}':y='{y_expr}':exact=1,"
         f"scale={out_width}:{out_height}"
     )
     cmd = [
@@ -208,7 +244,6 @@ def parse_args():
                          help="Path to a haarcascade_frontalface_default.xml file (default: bundled with opencv-python)")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Path to the ffmpeg executable")
     parser.add_argument("--ffprobe-path", default="ffprobe", help="Path to the ffprobe executable")
-    parser.add_argument("--keep-cmds", default=None, help="Optional path to also save the generated sendcmd script")
     return parser.parse_args()
 
 
@@ -221,7 +256,7 @@ def main():
     if args.ffmpeg_path == "ffmpeg" or args.ffprobe_path == "ffprobe":
         check_ffmpeg()
 
-    cascade = load_face_cascade(args.cascade_path)
+    cascades = load_face_cascades(args.cascade_path)
 
     width, height, duration = probe_video(args.input, args.ffprobe_path)
     target_ratio = 9 / 16
@@ -244,35 +279,26 @@ def main():
     print(f"[1/4] Source: {width}x{height}, {duration:.1f}s. Crop window: {crop_w}x{crop_h}, panning on '{axis}'.")
 
     print(f"[2/4] Sampling faces every {args.sample_interval}s ...")
-    samples = detect_face_centers(args.input, duration, args.sample_interval, axis, cascade, args.min_face_size)
+    samples = detect_face_centers(args.input, duration, args.sample_interval, axis, cascades, args.min_face_size)
     detected = sum(1 for _, c in samples if c is not None)
     print(f"    -> {detected}/{len(samples)} samples had a detected face")
     if detected == 0:
         print("    -> no faces detected anywhere, falling back to a centered crop")
 
-    print("[3/4] Building crop position track ...")
+    print("[3/4] Building crop position track (smooth pan, not per-second jumps) ...")
     crop_size = crop_w if axis == "x" else crop_h
     centers = fill_and_smooth(samples, default_center, args.smooth_window)
     positions = [min(max(c - crop_size / 2, pan_min), pan_max) for c in centers]
     times = [t for t, _ in samples]
 
-    cmds_path = args.keep_cmds or os.path.join(
-        os.path.dirname(os.path.abspath(args.output)) or ".", "_auto_crop_cmds.txt"
-    )
-    build_sendcmd_file(times, positions, cmds_path, axis)
-
-    init_x = round(positions[0]) if axis == "x" else 0
-    init_y = round(positions[0]) if axis == "y" else 0
+    pos_expr = build_position_expr(times, positions)
+    x_expr, y_expr = (pos_expr, "0") if axis == "x" else ("0", pos_expr)
 
     print(f"[4/4] Cropping and scaling to {args.out_width}x{args.out_height} ...")
-    try:
-        crop_and_scale(
-            args.input, args.output, cmds_path, crop_w, crop_h, init_x, init_y,
-            args.out_width, args.out_height, args.ffmpeg_path,
-        )
-    finally:
-        if not args.keep_cmds and os.path.isfile(cmds_path):
-            os.remove(cmds_path)
+    crop_and_scale(
+        args.input, args.output, crop_w, crop_h, x_expr, y_expr,
+        args.out_width, args.out_height, args.ffmpeg_path,
+    )
 
     print(f"Done: {args.output}")
 
